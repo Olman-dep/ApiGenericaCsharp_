@@ -3,6 +3,7 @@
 // Ruta: ApiGenericaCsharp/Repositorios/RepositorioConsultasSqlServer.cs
 // Mejora: Manejo inteligente de DateTime con hora 00:00:00 como DATE
 //         EN CONSULTAS Y PROCEDIMIENTOS ALMACENADOS
+// FIX: Corregido Size=0 en SqlParameter para strings vacíos y nvarchar(max)
 // --------------------------------------------------------------
 
 using System;
@@ -21,6 +22,11 @@ namespace ApiGenericaCsharp.Repositorios
     /// MEJORA IMPLEMENTADA:
     /// Detecta DateTime con hora 00:00:00 y los convierte a DateOnly automáticamente
     /// tanto en consultas como en procedimientos almacenados.
+    /// 
+    /// FIX CRÍTICO:
+    /// Corregido el error "Size tiene un tamaño no válido de 0" para parámetros
+    /// de tipo string (varchar/nvarchar) cuando el valor es vacío o null,
+    /// y para parámetros nvarchar(max) cuyo MaxLength es -1.
     /// </summary>
     public sealed class RepositorioConsultasSqlServer : IRepositorioConsultas
     {
@@ -107,323 +113,338 @@ namespace ApiGenericaCsharp.Repositorios
         }
 
         // ================================================================
+        // MÉTODO AUXILIAR: Determina el Size correcto para SqlParameter string
+        // FIX: Evita Size=0 que lanza InvalidOperationException en SqlClient
+        // ================================================================
+        private static int ResolverSize(int? maxLength)
+        {
+            if (!maxLength.HasValue)  return -1; // Sin metadato → MAX seguro
+            if (maxLength.Value == -1) return -1; // nvarchar(max)
+            if (maxLength.Value > 0)  return maxLength.Value; // nvarchar(n)
+            return -1; // Cualquier otro caso (0, negativo) → MAX seguro
+        }
+
+        // ================================================================
         // MÉTODO PRINCIPAL MEJORADO: Ejecuta un procedimiento almacenado genérico
         // MEJORA CRÍTICA: Ahora convierte DateTime con hora 00:00:00 a Date
+        // DETECTA SI ES FUNCTION O PROCEDURE
+        // FIX: Corregido Size=0 en todos los bloques de parámetros string
         // ================================================================
-
-// ================================================================
-// MÉTODO PRINCIPAL MEJORADO: Ejecuta un procedimiento almacenado genérico
-// MEJORA CRÍTICA: Ahora convierte DateTime con hora 00:00:00 a Date
-// DETECTA SI ES FUNCTION O PROCEDURE
-// ================================================================
-public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
-    string nombreSP,
-    Dictionary<string, object?> parametros)
-{
-    if (string.IsNullOrWhiteSpace(nombreSP))
-        throw new ArgumentException("El nombre del procedimiento no puede estar vacío.");
-
-    string cadenaConexion = _proveedorConexion.ObtenerCadenaConexion();
-    await using var conexion = new SqlConnection(cadenaConexion);
-    await conexion.OpenAsync();
-
-    // Detectar si es FUNCTION o PROCEDURE
-    string sqlTipo = "SELECT ROUTINE_TYPE FROM INFORMATION_SCHEMA.ROUTINES WHERE ROUTINE_NAME = @spName";
-    string tipoRutina = "PROCEDURE";
-    await using (var cmdTipo = new SqlCommand(sqlTipo, conexion))
-    {
-        cmdTipo.Parameters.AddWithValue("@spName", nombreSP);
-        var resultado = await cmdTipo.ExecuteScalarAsync();
-        tipoRutina = resultado?.ToString() ?? "PROCEDURE";
-    }
-
-    var metadatos = await ObtenerMetadatosParametrosAsync(conexion, nombreSP);
-
-    var parametrosNormalizados = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
-    foreach (var kv in parametros ?? new Dictionary<string, object?>())
-    {
-        var clave = kv.Key.StartsWith("@") ? kv.Key.Substring(1) : kv.Key;
-        parametrosNormalizados[clave] = kv.Value;
-    }
-
-    var tabla = new DataTable();
-
-    // Procesar según el tipo de rutina
-    if (tipoRutina == "FUNCTION")
-    {
-        // ============================================================
-        // MANEJO DE FUNCIONES
-        // ============================================================
-        var parametrosEntrada = metadatos.Where(m => !m.EsOutput).ToList();
-        var parametrosQuery = string.Join(", ", parametrosEntrada.Select((_, i) => $"@p{i}"));
-        var sqlLlamada = $"SELECT dbo.{nombreSP}({parametrosQuery}) AS Resultado";
-        
-        await using var comando = new SqlCommand(sqlLlamada, conexion);
-        comando.CommandType = CommandType.Text;
-        comando.CommandTimeout = 300;
-
-        // Agregar parámetros con nombres @p0, @p1, etc.
-        for (int i = 0; i < parametrosEntrada.Count; i++)
+        public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
+            string nombreSP,
+            Dictionary<string, object?> parametros)
         {
-            var meta = parametrosEntrada[i];
-            string clave = meta.Nombre.StartsWith("@") ? meta.Nombre.Substring(1) : meta.Nombre;
-            object valor = parametrosNormalizados.TryGetValue(clave, out var v) && v != null ? v : DBNull.Value;
+            if (string.IsNullOrWhiteSpace(nombreSP))
+                throw new ArgumentException("El nombre del procedimiento no puede estar vacío.");
 
-            // ============================================================
-            // MEJORA: Detección de JSON de 3 formas (como PostgreSQL)
-            // ============================================================
-            bool esJSON = meta.Tipo.ToLower() == "nvarchar" && meta.MaxLength == -1;
+            string cadenaConexion = _proveedorConexion.ObtenerCadenaConexion();
+            await using var conexion = new SqlConnection(cadenaConexion);
+            await conexion.OpenAsync();
 
-            if (!esJSON && valor is string sValor && !string.IsNullOrWhiteSpace(sValor))
+            // Detectar si es FUNCTION o PROCEDURE
+            string sqlTipo = "SELECT ROUTINE_TYPE FROM INFORMATION_SCHEMA.ROUTINES WHERE ROUTINE_NAME = @spName";
+            string tipoRutina = "PROCEDURE";
+            await using (var cmdTipo = new SqlCommand(sqlTipo, conexion))
             {
-                var nombreParam = meta.Nombre?.ToLower() ?? "";
-                var sValorTrim = sValor.TrimStart();
+                cmdTipo.Parameters.AddWithValue("@spName", nombreSP);
+                var resultado = await cmdTipo.ExecuteScalarAsync();
+                tipoRutina = resultado?.ToString() ?? "PROCEDURE";
+            }
 
-                if (sValorTrim.StartsWith("{") || sValorTrim.StartsWith("["))
+            var metadatos = await ObtenerMetadatosParametrosAsync(conexion, nombreSP);
+
+            var parametrosNormalizados = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in parametros ?? new Dictionary<string, object?>())
+            {
+                var clave = kv.Key.StartsWith("@") ? kv.Key.Substring(1) : kv.Key;
+                parametrosNormalizados[clave] = kv.Value;
+            }
+
+            var tabla = new DataTable();
+
+            // ============================================================
+            // MANEJO DE FUNCIONES
+            // ============================================================
+            if (tipoRutina == "FUNCTION")
+            {
+                var parametrosEntrada = metadatos.Where(m => !m.EsOutput).ToList();
+                var parametrosQuery = string.Join(", ", parametrosEntrada.Select((_, i) => $"@p{i}"));
+                var sqlLlamada = $"SELECT dbo.{nombreSP}({parametrosQuery}) AS Resultado";
+
+                await using var comando = new SqlCommand(sqlLlamada, conexion);
+                comando.CommandType = CommandType.Text;
+                comando.CommandTimeout = 300;
+
+                for (int i = 0; i < parametrosEntrada.Count; i++)
                 {
-                    esJSON = true;
-                }
-                else if (nombreParam.Contains("roles") || nombreParam.Contains("detalles") ||
-                         nombreParam.Contains("json") || nombreParam.Contains("data"))
-                {
-                    if (sValorTrim.StartsWith("{") || sValorTrim.StartsWith("["))
+                    var meta = parametrosEntrada[i];
+                    string clave = meta.Nombre.StartsWith("@") ? meta.Nombre.Substring(1) : meta.Nombre;
+                    object valor = parametrosNormalizados.TryGetValue(clave, out var v) && v != null ? v : DBNull.Value;
+
+                    bool esJSON = meta.Tipo.ToLower() == "nvarchar" && meta.MaxLength == -1;
+
+                    if (!esJSON && valor is string sValor && !string.IsNullOrWhiteSpace(sValor))
                     {
-                        esJSON = true;
-                    }
-                }
-            }
+                        var nombreParam = meta.Nombre?.ToLower() ?? "";
+                        var sValorTrim = sValor.TrimStart();
 
-            if (esJSON)
-            {
-                var param = new SqlParameter($"@p{i}", SqlDbType.NVarChar) { Value = valor == DBNull.Value ? DBNull.Value : valor.ToString() };
-                param.Size = -1;
-                comando.Parameters.Add(param);
-            }
-            // ============================================================
-            // MEJORA: VARCHAR/NVARCHAR - Convertir a string (como PostgreSQL)
-            // ============================================================
-            else if ((meta.Tipo.ToLower() == "varchar" || meta.Tipo.ToLower() == "nvarchar" || meta.Tipo.ToLower() == "char" || meta.Tipo.ToLower() == "nchar")
-                     && valor != DBNull.Value)
-            {
-                string valorStr = valor.ToString() ?? string.Empty;
-                var param = new SqlParameter($"@p{i}", MapearTipo(meta.Tipo)) { Value = valorStr };
-                if (meta.MaxLength.HasValue && meta.MaxLength.Value > 0)
-                    param.Size = meta.MaxLength.Value;
-                comando.Parameters.Add(param);
-            }
-            else if (valor is DateTime dt && dt.TimeOfDay == TimeSpan.Zero && meta.Tipo.ToLower() == "date")
-            {
-                comando.Parameters.Add(new SqlParameter($"@p{i}", SqlDbType.Date) { Value = DateOnly.FromDateTime(dt) });
-            }
-            else if (meta.Tipo.ToLower() == "int" && valor != DBNull.Value)
-            {
-                comando.Parameters.Add(new SqlParameter($"@p{i}", SqlDbType.Int) { Value = Convert.ToInt32(valor) });
-            }
-            else if (meta.Tipo.ToLower() == "bigint" && valor != DBNull.Value)
-            {
-                comando.Parameters.Add(new SqlParameter($"@p{i}", SqlDbType.BigInt) { Value = Convert.ToInt64(valor) });
-            }
-            else if ((meta.Tipo.ToLower() == "decimal" || meta.Tipo.ToLower() == "numeric") && valor != DBNull.Value)
-            {
-                comando.Parameters.Add(new SqlParameter($"@p{i}", SqlDbType.Decimal) { Value = Convert.ToDecimal(valor) });
-            }
-            else if (meta.Tipo.ToLower() == "bit" && valor != DBNull.Value)
-            {
-                comando.Parameters.Add(new SqlParameter($"@p{i}", SqlDbType.Bit) { Value = Convert.ToBoolean(valor) });
-            }
-            else
-            {
-                var param = new SqlParameter($"@p{i}", MapearTipo(meta.Tipo)) { Value = valor };
-                if (meta.MaxLength.HasValue && meta.MaxLength.Value > 0)
-                    param.Size = meta.MaxLength.Value;
-                comando.Parameters.Add(param);
-            }
-        }
-
-        await using var reader = await comando.ExecuteReaderAsync();
-        tabla.Load(reader);
-    }
-    else
-    {
-        // ============================================================
-        // MANEJO DE PROCEDIMIENTOS
-        // ============================================================
-        await using var comando = new SqlCommand(nombreSP, conexion);
-        comando.CommandType = CommandType.StoredProcedure;
-        comando.CommandTimeout = 300;
-
-        foreach (var meta in metadatos)
-        {
-            string clave = meta.Nombre?.StartsWith("@") == true ? meta.Nombre.Substring(1) : (meta.Nombre ?? string.Empty);
-            var sqlDbTipo = MapearTipo(meta.Tipo);
-
-            if (!meta.EsOutput)
-            {
-                object valor = parametrosNormalizados.TryGetValue(clave, out var v) && v != null
-                    ? v
-                    : DBNull.Value;
-
-                // ============================================================
-                // MEJORA: Detección de JSON de 3 formas (como PostgreSQL)
-                // 1. Por tipo (nvarchar(max) es el tipo JSON en SQL Server)
-                // 2. Por contenido (empieza con { o [)
-                // 3. Por nombre común de parámetro JSON
-                // ============================================================
-                bool esJSON = meta.Tipo.ToLower() == "nvarchar" && meta.MaxLength == -1; // nvarchar(max)
-
-                if (!esJSON && valor is string sValor && !string.IsNullOrWhiteSpace(sValor))
-                {
-                    var nombreParam = meta.Nombre?.ToLower() ?? "";
-                    var sValorTrim = sValor.TrimStart();
-
-                    // Detectar por contenido
-                    if (sValorTrim.StartsWith("{") || sValorTrim.StartsWith("["))
-                    {
-                        esJSON = true;
-                    }
-                    // Detectar por nombre común de parámetros JSON
-                    else if (nombreParam.Contains("roles") || nombreParam.Contains("detalles") ||
-                             nombreParam.Contains("json") || nombreParam.Contains("data"))
-                    {
                         if (sValorTrim.StartsWith("{") || sValorTrim.StartsWith("["))
-                        {
                             esJSON = true;
+                        else if (nombreParam.Contains("roles") || nombreParam.Contains("detalles") ||
+                                 nombreParam.Contains("json") || nombreParam.Contains("data"))
+                        {
+                            if (sValorTrim.StartsWith("{") || sValorTrim.StartsWith("["))
+                                esJSON = true;
                         }
                     }
+
+                    if (esJSON)
+                    {
+                        var param = new SqlParameter($"@p{i}", SqlDbType.NVarChar)
+                        {
+                            Value = valor == DBNull.Value ? DBNull.Value : valor.ToString(),
+                            Size  = -1
+                        };
+                        comando.Parameters.Add(param);
+                    }
+                    // FIX: varchar/nvarchar — siempre asignar Size, convertir vacío a DBNull
+                    else if (meta.Tipo.ToLower() == "varchar" || meta.Tipo.ToLower() == "nvarchar"
+                          || meta.Tipo.ToLower() == "char"    || meta.Tipo.ToLower() == "nchar")
+                    {
+                        string valorStr = (valor == DBNull.Value || valor is null)
+                            ? string.Empty
+                            : valor.ToString() ?? string.Empty;
+
+                        var param = new SqlParameter($"@p{i}", MapearTipo(meta.Tipo))
+                        {
+                            Value = string.IsNullOrEmpty(valorStr) ? DBNull.Value : (object)valorStr,
+                            Size  = ResolverSize(meta.MaxLength)
+                        };
+                        comando.Parameters.Add(param);
+                    }
+                    else if (valor is DateTime dt && dt.TimeOfDay == TimeSpan.Zero && meta.Tipo.ToLower() == "date")
+                    {
+                        comando.Parameters.Add(new SqlParameter($"@p{i}", SqlDbType.Date)
+                        {
+                            Value = DateOnly.FromDateTime(dt)
+                        });
+                    }
+                    else if (meta.Tipo.ToLower() == "int" && valor != DBNull.Value)
+                    {
+                        comando.Parameters.Add(new SqlParameter($"@p{i}", SqlDbType.Int)
+                        {
+                            Value = Convert.ToInt32(valor)
+                        });
+                    }
+                    else if (meta.Tipo.ToLower() == "bigint" && valor != DBNull.Value)
+                    {
+                        comando.Parameters.Add(new SqlParameter($"@p{i}", SqlDbType.BigInt)
+                        {
+                            Value = Convert.ToInt64(valor)
+                        });
+                    }
+                    else if ((meta.Tipo.ToLower() == "decimal" || meta.Tipo.ToLower() == "numeric") && valor != DBNull.Value)
+                    {
+                        comando.Parameters.Add(new SqlParameter($"@p{i}", SqlDbType.Decimal)
+                        {
+                            Value = Convert.ToDecimal(valor)
+                        });
+                    }
+                    else if (meta.Tipo.ToLower() == "bit" && valor != DBNull.Value)
+                    {
+                        comando.Parameters.Add(new SqlParameter($"@p{i}", SqlDbType.Bit)
+                        {
+                            Value = Convert.ToBoolean(valor)
+                        });
+                    }
+                    else
+                    {
+                        // FIX: bloque else — asignar Size para tipos string sin MaxLength explícito
+                        var param = new SqlParameter($"@p{i}", MapearTipo(meta.Tipo)) { Value = valor };
+                        var sqlDbTipoLocal = MapearTipo(meta.Tipo);
+                        if (sqlDbTipoLocal == SqlDbType.NVarChar || sqlDbTipoLocal == SqlDbType.VarChar
+                         || sqlDbTipoLocal == SqlDbType.NChar    || sqlDbTipoLocal == SqlDbType.Char)
+                            param.Size = ResolverSize(meta.MaxLength);
+                        else if (meta.MaxLength.HasValue && meta.MaxLength.Value != 0)
+                            param.Size = meta.MaxLength.Value == -1 ? -1 : meta.MaxLength.Value;
+                        comando.Parameters.Add(param);
+                    }
                 }
 
-                if (esJSON)
-                {
-                    // Tratar como JSON (NVARCHAR(MAX))
-                    var param = new SqlParameter($"@{clave}", SqlDbType.NVarChar)
-                    {
-                        Direction = ParameterDirection.Input,
-                        Value = valor == DBNull.Value ? DBNull.Value : valor.ToString()
-                    };
-                    param.Size = -1; // -1 indica MAX
-                    comando.Parameters.Add(param);
-                }
-                // ============================================================
-                // MEJORA: VARCHAR/NVARCHAR - Convertir a string si no lo es
-                // Resuelve el caso de Int32 enviado como contraseña (como PostgreSQL)
-                // ============================================================
-                else if ((meta.Tipo.ToLower() == "varchar" || meta.Tipo.ToLower() == "nvarchar" || meta.Tipo.ToLower() == "char" || meta.Tipo.ToLower() == "nchar")
-                         && valor != DBNull.Value)
-                {
-                    string valorStr = valor.ToString() ?? string.Empty;
-                    var param = new SqlParameter($"@{clave}", MapearTipo(meta.Tipo))
-                    {
-                        Direction = ParameterDirection.Input,
-                        Value = valorStr
-                    };
-                    if (meta.MaxLength.HasValue && meta.MaxLength.Value > 0)
-                        param.Size = meta.MaxLength.Value;
-                    comando.Parameters.Add(param);
-                }
-                else if (valor is DateTime dt && dt.TimeOfDay == TimeSpan.Zero && meta.Tipo.ToLower() == "date")
-                {
-                    var param = new SqlParameter($"@{clave}", SqlDbType.Date)
-                    {
-                        Direction = ParameterDirection.Input,
-                        Value = DateOnly.FromDateTime(dt)
-                    };
-                    comando.Parameters.Add(param);
-                }
-                else if (meta.Tipo.ToLower() == "int" && valor != DBNull.Value)
-                {
-                    int valorInt = Convert.ToInt32(valor);
-                    var param = new SqlParameter($"@{clave}", SqlDbType.Int)
-                    {
-                        Direction = ParameterDirection.Input,
-                        Value = valorInt
-                    };
-                    comando.Parameters.Add(param);
-                }
-                else if (meta.Tipo.ToLower() == "bigint" && valor != DBNull.Value)
-                {
-                    long valorLong = Convert.ToInt64(valor);
-                    var param = new SqlParameter($"@{clave}", SqlDbType.BigInt)
-                    {
-                        Direction = ParameterDirection.Input,
-                        Value = valorLong
-                    };
-                    comando.Parameters.Add(param);
-                }
-                else if ((meta.Tipo.ToLower() == "decimal" || meta.Tipo.ToLower() == "numeric") && valor != DBNull.Value)
-                {
-                    decimal valorDec = Convert.ToDecimal(valor);
-                    var param = new SqlParameter($"@{clave}", SqlDbType.Decimal)
-                    {
-                        Direction = ParameterDirection.Input,
-                        Value = valorDec
-                    };
-                    comando.Parameters.Add(param);
-                }
-                else if (meta.Tipo.ToLower() == "bit" && valor != DBNull.Value)
-                {
-                    bool valorBool = Convert.ToBoolean(valor);
-                    var param = new SqlParameter($"@{clave}", SqlDbType.Bit)
-                    {
-                        Direction = ParameterDirection.Input,
-                        Value = valorBool
-                    };
-                    comando.Parameters.Add(param);
-                }
-                else
-                {
-                    var param = new SqlParameter($"@{clave}", sqlDbTipo)
-                    {
-                        Direction = ParameterDirection.Input,
-                        Value = valor
-                    };
-
-                    if (meta.MaxLength.HasValue && meta.MaxLength.Value > 0)
-                        param.Size = meta.MaxLength.Value;
-
-                    comando.Parameters.Add(param);
-                }
+                await using var reader = await comando.ExecuteReaderAsync();
+                tabla.Load(reader);
             }
             else
             {
-                var param = new SqlParameter($"@{clave}", sqlDbTipo)
+                // ============================================================
+                // MANEJO DE PROCEDIMIENTOS
+                // ============================================================
+                await using var comando = new SqlCommand(nombreSP, conexion);
+                comando.CommandType = CommandType.StoredProcedure;
+                comando.CommandTimeout = 300;
+
+                foreach (var meta in metadatos)
                 {
-                    Direction = ParameterDirection.Output
-                };
+                    string clave = meta.Nombre?.StartsWith("@") == true
+                        ? meta.Nombre.Substring(1)
+                        : (meta.Nombre ?? string.Empty);
 
-                if (meta.MaxLength.HasValue && meta.MaxLength.Value > 0)
-                    param.Size = meta.MaxLength.Value;
+                    var sqlDbTipo = MapearTipo(meta.Tipo);
 
-                comando.Parameters.Add(param);
+                    if (!meta.EsOutput)
+                    {
+                        object valor = parametrosNormalizados.TryGetValue(clave, out var v) && v != null
+                            ? v
+                            : DBNull.Value;
+
+                        // Detección de JSON (nvarchar(max) o contenido JSON)
+                        bool esJSON = meta.Tipo.ToLower() == "nvarchar" && meta.MaxLength == -1;
+
+                        if (!esJSON && valor is string sValor && !string.IsNullOrWhiteSpace(sValor))
+                        {
+                            var nombreParam = meta.Nombre?.ToLower() ?? "";
+                            var sValorTrim = sValor.TrimStart();
+
+                            if (sValorTrim.StartsWith("{") || sValorTrim.StartsWith("["))
+                                esJSON = true;
+                            else if (nombreParam.Contains("roles") || nombreParam.Contains("detalles") ||
+                                     nombreParam.Contains("json") || nombreParam.Contains("data"))
+                            {
+                                if (sValorTrim.StartsWith("{") || sValorTrim.StartsWith("["))
+                                    esJSON = true;
+                            }
+                        }
+
+                        if (esJSON)
+                        {
+                            var param = new SqlParameter($"@{clave}", SqlDbType.NVarChar)
+                            {
+                                Direction = ParameterDirection.Input,
+                                Value     = valor == DBNull.Value ? DBNull.Value : valor.ToString(),
+                                Size      = -1
+                            };
+                            comando.Parameters.Add(param);
+                        }
+                        // FIX: varchar/nvarchar — siempre asignar Size, convertir vacío a DBNull
+                        else if (meta.Tipo.ToLower() == "varchar" || meta.Tipo.ToLower() == "nvarchar"
+                              || meta.Tipo.ToLower() == "char"    || meta.Tipo.ToLower() == "nchar")
+                        {
+                            string valorStr = (valor == DBNull.Value || valor is null)
+                                ? string.Empty
+                                : valor.ToString() ?? string.Empty;
+
+                            var param = new SqlParameter($"@{clave}", MapearTipo(meta.Tipo))
+                            {
+                                Direction = ParameterDirection.Input,
+                                Value     = string.IsNullOrEmpty(valorStr) ? DBNull.Value : (object)valorStr,
+                                Size      = ResolverSize(meta.MaxLength)
+                            };
+                            comando.Parameters.Add(param);
+                        }
+                        else if (valor is DateTime dt && dt.TimeOfDay == TimeSpan.Zero && meta.Tipo.ToLower() == "date")
+                        {
+                            var param = new SqlParameter($"@{clave}", SqlDbType.Date)
+                            {
+                                Direction = ParameterDirection.Input,
+                                Value     = DateOnly.FromDateTime(dt)
+                            };
+                            comando.Parameters.Add(param);
+                        }
+                        else if (meta.Tipo.ToLower() == "int" && valor != DBNull.Value)
+                        {
+                            var param = new SqlParameter($"@{clave}", SqlDbType.Int)
+                            {
+                                Direction = ParameterDirection.Input,
+                                Value     = Convert.ToInt32(valor)
+                            };
+                            comando.Parameters.Add(param);
+                        }
+                        else if (meta.Tipo.ToLower() == "bigint" && valor != DBNull.Value)
+                        {
+                            var param = new SqlParameter($"@{clave}", SqlDbType.BigInt)
+                            {
+                                Direction = ParameterDirection.Input,
+                                Value     = Convert.ToInt64(valor)
+                            };
+                            comando.Parameters.Add(param);
+                        }
+                        else if ((meta.Tipo.ToLower() == "decimal" || meta.Tipo.ToLower() == "numeric") && valor != DBNull.Value)
+                        {
+                            var param = new SqlParameter($"@{clave}", SqlDbType.Decimal)
+                            {
+                                Direction = ParameterDirection.Input,
+                                Value     = Convert.ToDecimal(valor)
+                            };
+                            comando.Parameters.Add(param);
+                        }
+                        else if (meta.Tipo.ToLower() == "bit" && valor != DBNull.Value)
+                        {
+                            var param = new SqlParameter($"@{clave}", SqlDbType.Bit)
+                            {
+                                Direction = ParameterDirection.Input,
+                                Value     = Convert.ToBoolean(valor)
+                            };
+                            comando.Parameters.Add(param);
+                        }
+                        else
+                        {
+                            // FIX: bloque else — asignar Size para tipos string sin MaxLength explícito
+                            var param = new SqlParameter($"@{clave}", sqlDbTipo)
+                            {
+                                Direction = ParameterDirection.Input,
+                                Value     = valor
+                            };
+                            if (sqlDbTipo == SqlDbType.NVarChar || sqlDbTipo == SqlDbType.VarChar
+                             || sqlDbTipo == SqlDbType.NChar    || sqlDbTipo == SqlDbType.Char)
+                                param.Size = ResolverSize(meta.MaxLength);
+                            else if (meta.MaxLength.HasValue && meta.MaxLength.Value != 0)
+                                param.Size = meta.MaxLength.Value == -1 ? -1 : meta.MaxLength.Value;
+                            comando.Parameters.Add(param);
+                        }
+                    }
+                    else
+                    {
+                        // FIX: parámetros OUTPUT — asignar Size para tipos string
+                        var param = new SqlParameter($"@{clave}", sqlDbTipo)
+                        {
+                            Direction = ParameterDirection.Output
+                        };
+                        if (sqlDbTipo == SqlDbType.NVarChar || sqlDbTipo == SqlDbType.VarChar
+                         || sqlDbTipo == SqlDbType.NChar    || sqlDbTipo == SqlDbType.Char)
+                            param.Size = ResolverSize(meta.MaxLength);
+                        else if (meta.MaxLength.HasValue && meta.MaxLength.Value != 0)
+                            param.Size = meta.MaxLength.Value == -1 ? -1 : meta.MaxLength.Value;
+                        comando.Parameters.Add(param);
+                    }
+                }
+
+                try
+                {
+                    await using var reader = await comando.ExecuteReaderAsync();
+                    tabla.Load(reader);
+                }
+                catch
+                {
+                    await comando.ExecuteNonQueryAsync();
+                }
+
+                foreach (SqlParameter param in comando.Parameters)
+                {
+                    if (param.Direction == ParameterDirection.Output || param.Direction == ParameterDirection.InputOutput)
+                    {
+                        if (!tabla.Columns.Contains(param.ParameterName))
+                            tabla.Columns.Add(param.ParameterName);
+
+                        if (tabla.Rows.Count == 0)
+                            tabla.Rows.Add(tabla.NewRow());
+
+                        tabla.Rows[0][param.ParameterName] = param.Value == null ? DBNull.Value : param.Value;
+                    }
+                }
             }
+
+            return tabla;
         }
-
-        try
-        {
-            await using var reader = await comando.ExecuteReaderAsync();
-            tabla.Load(reader);
-        }
-        catch
-        {
-            await comando.ExecuteNonQueryAsync();
-        }
-
-        foreach (SqlParameter param in comando.Parameters)
-        {
-            if (param.Direction == ParameterDirection.Output || param.Direction == ParameterDirection.InputOutput)
-            {
-                if (!tabla.Columns.Contains(param.ParameterName))
-                    tabla.Columns.Add(param.ParameterName);
-
-                if (tabla.Rows.Count == 0)
-                    tabla.Rows.Add(tabla.NewRow());
-
-                tabla.Rows[0][param.ParameterName] = param.Value == null ? DBNull.Value : param.Value;
-            }
-        }
-    }
-
-    return tabla;
-}
 
         // ================================================================
         // MÉTODO MEJORADO: Ejecuta una consulta SQL parametrizada
@@ -446,12 +467,8 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
                 string nombreParam = p.Key.StartsWith("@") ? p.Key : $"@{p.Key}";
                 object? valor = p.Value ?? DBNull.Value;
 
-                // MEJORA CRÍTICA: Detectar DateTime con hora 00:00:00
                 if (valor is DateTime dt && dt.TimeOfDay == TimeSpan.Zero)
                 {
-                    // Si la hora es 00:00:00, probablemente es una fecha sin hora
-                    // Convertir a Date para que SQL Server lo trate como DATE
-                    // Esto evita problemas de comparación con columnas tipo DATE
                     comando.Parameters.Add(new SqlParameter(nombreParam, SqlDbType.Date)
                     {
                         Value = DateOnly.FromDateTime(dt)
@@ -459,7 +476,6 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
                 }
                 else
                 {
-                    // Caso normal: dejar que AddWithValue infiera el tipo
                     comando.Parameters.AddWithValue(nombreParam, valor);
                 }
             }
@@ -473,7 +489,7 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
         // MÉTODO: Valida si una consulta SQL con parámetros es sintácticamente correcta
         // ================================================================
         public async Task<(bool esValida, string? mensajeError)> ValidarConsultaConDictionaryAsync(
-            string consultaSQL, 
+            string consultaSQL,
             Dictionary<string, object?> parametros)
         {
             try
@@ -481,8 +497,7 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
                 string cadenaConexion = _proveedorConexion.ObtenerCadenaConexion();
                 await using var conexion = new SqlConnection(cadenaConexion);
                 await conexion.OpenAsync();
-                
-                // Activar modo PARSEONLY para validación sin ejecución
+
                 await using var comandoParseOn = new SqlCommand("SET PARSEONLY ON", conexion);
                 await comandoParseOn.ExecuteNonQueryAsync();
 
@@ -497,7 +512,6 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
 
                 await comando.ExecuteNonQueryAsync();
 
-                // Desactivar modo PARSEONLY
                 await using var comandoParseOff = new SqlCommand("SET PARSEONLY OFF", conexion);
                 await comandoParseOff.ExecuteNonQueryAsync();
 
@@ -532,7 +546,6 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
             await using var conexion = new SqlConnection(cadenaConexion);
             await conexion.OpenAsync();
 
-            // Si se proporciona un esquema específico, verificar que la tabla existe en ese esquema
             if (!string.IsNullOrWhiteSpace(esquemaPredeterminado))
             {
                 await using var cmdVerificar = new SqlCommand(
@@ -544,7 +557,6 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
                     return resultadoVerificado.ToString();
             }
 
-            // Si no se proporciona esquema o no se encontró, buscar primero en 'dbo', luego en cualquier esquema
             string sql = @"
                 SELECT TOP 1 TABLE_SCHEMA
                 FROM INFORMATION_SCHEMA.TABLES
@@ -565,7 +577,6 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
             await using var conexion = new SqlConnection(cadenaConexion);
             await conexion.OpenAsync();
 
-            // Query completa con constraints (PK, FK, UNIQUE, CHECK, DEFAULT, IDENTITY)
             string sql = @"
                 SELECT
                     c.COLUMN_NAME AS column_name,
@@ -584,7 +595,6 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
                     fk.fk_constraint_name,
                     chk.check_clause
                 FROM INFORMATION_SCHEMA.COLUMNS c
-                -- Primary Key
                 LEFT JOIN (
                     SELECT kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.COLUMN_NAME
                     FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
@@ -595,7 +605,6 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
                 ) pk ON c.TABLE_SCHEMA = pk.TABLE_SCHEMA
                     AND c.TABLE_NAME = pk.TABLE_NAME
                     AND c.COLUMN_NAME = pk.COLUMN_NAME
-                -- Unique
                 LEFT JOIN (
                     SELECT kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.COLUMN_NAME
                     FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
@@ -606,7 +615,6 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
                 ) uq ON c.TABLE_SCHEMA = uq.TABLE_SCHEMA
                     AND c.TABLE_NAME = uq.TABLE_NAME
                     AND c.COLUMN_NAME = uq.COLUMN_NAME
-                -- Foreign Key
                 LEFT JOIN (
                     SELECT
                         kcu.TABLE_SCHEMA,
@@ -626,7 +634,6 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
                 ) fk ON c.TABLE_SCHEMA = fk.TABLE_SCHEMA
                     AND c.TABLE_NAME = fk.TABLE_NAME
                     AND c.COLUMN_NAME = fk.COLUMN_NAME
-                -- Check constraints
                 LEFT JOIN (
                     SELECT
                         ccu.TABLE_SCHEMA,
@@ -658,7 +665,7 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
             string cadenaConexion = _proveedorConexion.ObtenerCadenaConexion();
             await using var conexion = new SqlConnection(cadenaConexion);
             await conexion.OpenAsync();
-            
+
             string sql = @"
                 SELECT
                     t.TABLE_NAME AS table_name,
@@ -686,32 +693,15 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
             await using var conexion = new SqlConnection(cadenaConexion);
             await conexion.OpenAsync();
 
-            // 1. Tablas con columnas y constraints
-            resultado["tablas"] = await ObtenerTablasConColumnasAsync(conexion);
-
-            // 2. Vistas
-            resultado["vistas"] = await ObtenerVistasAsync(conexion);
-
-            // 3. Procedimientos almacenados
+            resultado["tablas"]       = await ObtenerTablasConColumnasAsync(conexion);
+            resultado["vistas"]       = await ObtenerVistasAsync(conexion);
             resultado["procedimientos"] = await ObtenerProcedimientosAsync(conexion);
-
-            // 4. Funciones
-            resultado["funciones"] = await ObtenerFuncionesAsync(conexion);
-
-            // 5. Triggers
-            resultado["triggers"] = await ObtenerTriggersAsync(conexion);
-
-            // 6. Índices
-            resultado["indices"] = await ObtenerIndicesAsync(conexion);
-
-            // 7. Secuencias
-            resultado["secuencias"] = await ObtenerSecuenciasAsync(conexion);
-
-            // 8. Tipos definidos por usuario
-            resultado["tipos"] = await ObtenerTiposPersonalizadosAsync(conexion);
-
-            // 9. Sinónimos
-            resultado["sinonimos"] = await ObtenerSinonimosAsync(conexion);
+            resultado["funciones"]    = await ObtenerFuncionesAsync(conexion);
+            resultado["triggers"]     = await ObtenerTriggersAsync(conexion);
+            resultado["indices"]      = await ObtenerIndicesAsync(conexion);
+            resultado["secuencias"]   = await ObtenerSecuenciasAsync(conexion);
+            resultado["tipos"]        = await ObtenerTiposPersonalizadosAsync(conexion);
+            resultado["sinonimos"]    = await ObtenerSinonimosAsync(conexion);
 
             return resultado;
         }
@@ -724,7 +714,6 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
         {
             var tablas = new List<Dictionary<string, object?>>();
 
-            // Obtener todas las tablas
             string sqlTablas = @"
                 SELECT
                     s.name AS schema_name,
@@ -757,12 +746,12 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
             {
                 var tablaDict = new Dictionary<string, object?>
                 {
-                    ["schema"] = schema,
-                    ["nombre"] = tabla,
-                    ["comentario"] = comentario,
-                    ["columnas"] = await ObtenerColumnasTablaAsync(conexion, schema, tabla),
+                    ["schema"]       = schema,
+                    ["nombre"]       = tabla,
+                    ["comentario"]   = comentario,
+                    ["columnas"]     = await ObtenerColumnasTablaAsync(conexion, schema, tabla),
                     ["foreign_keys"] = await ObtenerForeignKeysTablaAsync(conexion, schema, tabla),
-                    ["indices"] = await ObtenerIndicesTablaAsync(conexion, schema, tabla)
+                    ["indices"]      = await ObtenerIndicesTablaAsync(conexion, schema, tabla)
                 };
                 tablas.Add(tablaDict);
             }
@@ -821,18 +810,18 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
             {
                 columnas.Add(new Dictionary<string, object?>
                 {
-                    ["nombre"] = reader.GetString(0),
-                    ["tipo"] = reader.GetString(1),
+                    ["nombre"]          = reader.GetString(0),
+                    ["tipo"]            = reader.GetString(1),
                     ["longitud_maxima"] = reader.IsDBNull(2) ? null : reader.GetInt16(2),
-                    ["precision"] = reader.IsDBNull(3) ? null : reader.GetByte(3),
-                    ["escala"] = reader.IsDBNull(4) ? null : reader.GetByte(4),
-                    ["nullable"] = reader.GetBoolean(5),
-                    ["valor_default"] = reader.IsDBNull(6) ? null : reader.GetString(6),
-                    ["posicion"] = reader.GetInt32(7),
-                    ["es_primary_key"] = reader.GetInt32(8) == 1,
-                    ["es_unique"] = reader.GetInt32(9) == 1,
-                    ["es_identity"] = reader.GetBoolean(10),
-                    ["comentario"] = reader.IsDBNull(11) ? null : reader.GetString(11)
+                    ["precision"]       = reader.IsDBNull(3) ? null : reader.GetByte(3),
+                    ["escala"]          = reader.IsDBNull(4) ? null : reader.GetByte(4),
+                    ["nullable"]        = reader.GetBoolean(5),
+                    ["valor_default"]   = reader.IsDBNull(6) ? null : reader.GetString(6),
+                    ["posicion"]        = reader.GetInt32(7),
+                    ["es_primary_key"]  = reader.GetInt32(8) == 1,
+                    ["es_unique"]       = reader.GetInt32(9) == 1,
+                    ["es_identity"]     = reader.GetBoolean(10),
+                    ["comentario"]      = reader.IsDBNull(11) ? null : reader.GetString(11)
                 });
             }
 
@@ -868,14 +857,13 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
             {
                 fks.Add(new Dictionary<string, object?>
                 {
-                    // Nombres compatibles con GeneradorSPController.DetectarRelacionesMaestroDetalle
-                    ["constraint_name"] = reader.GetString(0),
-                    ["column_name"] = reader.GetString(1),
+                    ["constraint_name"]    = reader.GetString(0),
+                    ["column_name"]        = reader.GetString(1),
                     ["foreign_schema_name"] = reader.GetString(2),
                     ["foreign_table_name"] = reader.GetString(3),
                     ["foreign_column_name"] = reader.GetString(4),
-                    ["on_update"] = reader.GetString(5),
-                    ["on_delete"] = reader.GetString(6)
+                    ["on_update"]          = reader.GetString(5),
+                    ["on_delete"]          = reader.GetString(6)
                 });
             }
 
@@ -911,11 +899,11 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
             {
                 indices.Add(new Dictionary<string, object?>
                 {
-                    ["nombre"] = reader.GetString(0),
-                    ["tipo"] = reader.GetString(1),
-                    ["es_unique"] = reader.GetBoolean(2),
+                    ["nombre"]         = reader.GetString(0),
+                    ["tipo"]           = reader.GetString(1),
+                    ["es_unique"]      = reader.GetBoolean(2),
                     ["es_primary_key"] = reader.GetBoolean(3),
-                    ["columnas"] = reader.GetString(4)
+                    ["columnas"]       = reader.GetString(4)
                 });
             }
 
@@ -949,8 +937,8 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
             {
                 vistas.Add(new Dictionary<string, object?>
                 {
-                    ["schema"] = reader.GetString(0),
-                    ["nombre"] = reader.GetString(1),
+                    ["schema"]     = reader.GetString(0),
+                    ["nombre"]     = reader.GetString(1),
                     ["definicion"] = reader.IsDBNull(2) ? null : reader.GetString(2),
                     ["comentario"] = reader.IsDBNull(3) ? null : reader.GetString(3)
                 });
@@ -1002,13 +990,13 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
             {
                 var procDict = new Dictionary<string, object?>
                 {
-                    ["schema"] = schema,
-                    ["nombre"] = nombre,
-                    ["definicion"] = definicion,
-                    ["fecha_creacion"] = created,
-                    ["fecha_modificacion"] = modified,
-                    ["comentario"] = comentario,
-                    ["parametros"] = await ObtenerParametrosRutinaAsync(conexion, schema, nombre)
+                    ["schema"]              = schema,
+                    ["nombre"]              = nombre,
+                    ["definicion"]          = definicion,
+                    ["fecha_creacion"]      = created,
+                    ["fecha_modificacion"]  = modified,
+                    ["comentario"]          = comentario,
+                    ["parametros"]          = await ObtenerParametrosRutinaAsync(conexion, schema, nombre)
                 };
                 procedimientos.Add(procDict);
             }
@@ -1036,7 +1024,7 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
                     ON ep.major_id = o.object_id
                     AND ep.minor_id = 0
                     AND ep.name = 'MS_Description'
-                WHERE o.type IN ('FN', 'IF', 'TF', 'FS', 'FT')  -- Scalar, Inline Table, Table-valued, CLR Scalar, CLR Table
+                WHERE o.type IN ('FN', 'IF', 'TF', 'FS', 'FT')
                 AND o.is_ms_shipped = 0
                 ORDER BY s.name, o.name";
 
@@ -1062,14 +1050,14 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
             {
                 var funcDict = new Dictionary<string, object?>
                 {
-                    ["schema"] = schema,
-                    ["nombre"] = nombre,
-                    ["tipo"] = tipo,
-                    ["definicion"] = definicion,
-                    ["fecha_creacion"] = created,
+                    ["schema"]             = schema,
+                    ["nombre"]             = nombre,
+                    ["tipo"]               = tipo,
+                    ["definicion"]         = definicion,
+                    ["fecha_creacion"]     = created,
                     ["fecha_modificacion"] = modified,
-                    ["comentario"] = comentario,
-                    ["parametros"] = await ObtenerParametrosRutinaAsync(conexion, schema, nombre)
+                    ["comentario"]         = comentario,
+                    ["parametros"]         = await ObtenerParametrosRutinaAsync(conexion, schema, nombre)
                 };
                 funciones.Add(funcDict);
             }
@@ -1105,18 +1093,18 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
             while (await reader.ReadAsync())
             {
                 var nombreParam = reader.GetString(0);
-                if (string.IsNullOrEmpty(nombreParam)) continue; // Saltar return value
+                if (string.IsNullOrEmpty(nombreParam)) continue;
 
                 parametros.Add(new Dictionary<string, object?>
                 {
-                    ["nombre"] = nombreParam,
-                    ["tipo"] = reader.GetString(1),
+                    ["nombre"]         = nombreParam,
+                    ["tipo"]           = reader.GetString(1),
                     ["longitud_maxima"] = reader.IsDBNull(2) ? null : reader.GetInt16(2),
-                    ["precision"] = reader.IsDBNull(3) ? null : reader.GetByte(3),
-                    ["escala"] = reader.IsDBNull(4) ? null : reader.GetByte(4),
-                    ["es_output"] = reader.GetBoolean(5),
-                    ["tiene_default"] = reader.GetBoolean(6),
-                    ["valor_default"] = reader.IsDBNull(7) ? null : reader.GetValue(7)
+                    ["precision"]      = reader.IsDBNull(3) ? null : reader.GetByte(3),
+                    ["escala"]         = reader.IsDBNull(4) ? null : reader.GetByte(4),
+                    ["es_output"]      = reader.GetBoolean(5),
+                    ["tiene_default"]  = reader.GetBoolean(6),
+                    ["valor_default"]  = reader.IsDBNull(7) ? null : reader.GetValue(7)
                 });
             }
 
@@ -1158,14 +1146,14 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
             {
                 triggers.Add(new Dictionary<string, object?>
                 {
-                    ["schema"] = reader.GetString(0),
-                    ["nombre"] = reader.GetString(1),
-                    ["tabla"] = reader.GetString(2),
-                    ["deshabilitado"] = reader.GetBoolean(3),
-                    ["es_instead_of"] = reader.GetBoolean(4),
-                    ["definicion"] = reader.IsDBNull(5) ? null : reader.GetString(5),
-                    ["evento"] = reader.IsDBNull(6) ? null : reader.GetString(6),
-                    ["fecha_creacion"] = reader.GetDateTime(7),
+                    ["schema"]             = reader.GetString(0),
+                    ["nombre"]             = reader.GetString(1),
+                    ["tabla"]              = reader.GetString(2),
+                    ["deshabilitado"]      = reader.GetBoolean(3),
+                    ["es_instead_of"]      = reader.GetBoolean(4),
+                    ["definicion"]         = reader.IsDBNull(5) ? null : reader.GetString(5),
+                    ["evento"]             = reader.IsDBNull(6) ? null : reader.GetString(6),
+                    ["fecha_creacion"]     = reader.GetDateTime(7),
                     ["fecha_modificacion"] = reader.GetDateTime(8)
                 });
             }
@@ -1204,15 +1192,15 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
             {
                 indices.Add(new Dictionary<string, object?>
                 {
-                    ["schema"] = reader.GetString(0),
-                    ["tabla"] = reader.GetString(1),
-                    ["nombre"] = reader.GetString(2),
-                    ["tipo"] = reader.GetString(3),
-                    ["es_unique"] = reader.GetBoolean(4),
-                    ["es_primary_key"] = reader.GetBoolean(5),
+                    ["schema"]             = reader.GetString(0),
+                    ["tabla"]              = reader.GetString(1),
+                    ["nombre"]             = reader.GetString(2),
+                    ["tipo"]               = reader.GetString(3),
+                    ["es_unique"]          = reader.GetBoolean(4),
+                    ["es_primary_key"]     = reader.GetBoolean(5),
                     ["es_unique_constraint"] = reader.GetBoolean(6),
-                    ["columnas"] = reader.GetString(7),
-                    ["filtro"] = reader.IsDBNull(8) ? null : reader.GetString(8)
+                    ["columnas"]           = reader.GetString(7),
+                    ["filtro"]             = reader.IsDBNull(8) ? null : reader.GetString(8)
                 });
             }
 
@@ -1245,15 +1233,15 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
             {
                 secuencias.Add(new Dictionary<string, object?>
                 {
-                    ["schema"] = reader.GetString(0),
-                    ["nombre"] = reader.GetString(1),
-                    ["tipo"] = reader.GetString(2),
+                    ["schema"]        = reader.GetString(0),
+                    ["nombre"]        = reader.GetString(1),
+                    ["tipo"]          = reader.GetString(2),
                     ["valor_inicial"] = reader.GetValue(3),
-                    ["incremento"] = reader.GetValue(4),
-                    ["valor_minimo"] = reader.GetValue(5),
-                    ["valor_maximo"] = reader.GetValue(6),
-                    ["es_ciclica"] = reader.GetBoolean(7),
-                    ["valor_actual"] = reader.GetValue(8)
+                    ["incremento"]    = reader.GetValue(4),
+                    ["valor_minimo"]  = reader.GetValue(5),
+                    ["valor_maximo"]  = reader.GetValue(6),
+                    ["es_ciclica"]    = reader.GetBoolean(7),
+                    ["valor_actual"]  = reader.GetValue(8)
                 });
             }
 
@@ -1291,14 +1279,14 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
             {
                 tipos.Add(new Dictionary<string, object?>
                 {
-                    ["schema"] = reader.GetString(0),
-                    ["nombre"] = reader.GetString(1),
-                    ["categoria"] = reader.GetString(2),
-                    ["tipo_base"] = reader.IsDBNull(3) ? null : reader.GetString(3),
+                    ["schema"]          = reader.GetString(0),
+                    ["nombre"]          = reader.GetString(1),
+                    ["categoria"]       = reader.GetString(2),
+                    ["tipo_base"]       = reader.IsDBNull(3) ? null : reader.GetString(3),
                     ["longitud_maxima"] = reader.GetInt16(4),
-                    ["precision"] = reader.GetByte(5),
-                    ["escala"] = reader.GetByte(6),
-                    ["nullable"] = reader.GetBoolean(7)
+                    ["precision"]       = reader.GetByte(5),
+                    ["escala"]          = reader.GetByte(6),
+                    ["nullable"]        = reader.GetBoolean(7)
                 });
             }
 
@@ -1326,10 +1314,10 @@ public async Task<DataTable> EjecutarProcedimientoAlmacenadoConDictionaryAsync(
             {
                 sinonimos.Add(new Dictionary<string, object?>
                 {
-                    ["schema"] = reader.GetString(0),
-                    ["nombre"] = reader.GetString(1),
-                    ["objeto_destino"] = reader.GetString(2),
-                    ["fecha_creacion"] = reader.GetDateTime(3)
+                    ["schema"]          = reader.GetString(0),
+                    ["nombre"]          = reader.GetString(1),
+                    ["objeto_destino"]  = reader.GetString(2),
+                    ["fecha_creacion"]  = reader.GetDateTime(3)
                 });
             }
 
