@@ -225,6 +225,8 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
         };
     });
 
+    
+
 // Construye la aplicación con todo lo configurado arriba.
 var app = builder.Build();
 
